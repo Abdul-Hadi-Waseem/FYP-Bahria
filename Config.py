@@ -57,8 +57,19 @@ num_k = 4                   # N-fold cross validation
 device = "cuda"             # device
 lr = 0.0001                 # learn rate
 weight_decay = 0.0001       # l2 normalization
-EPOCH = 300
+# EPOCH = 300
+EPOCH=50
 batch_size = 64
+
+# Training parameters
+BATCH_SIZE = 32
+INITIAL_LR = 1e-3
+MIN_LR = 1e-6
+WARMUP_EPOCHS = 5
+WEIGHT_DECAY = 0.01
+DROPOUT_RATE = 0.5
+NUM_EPOCHS = 150
+LABEL_SMOOTHING = 0.1
 
 
 

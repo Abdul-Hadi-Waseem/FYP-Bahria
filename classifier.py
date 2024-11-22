@@ -8,6 +8,8 @@ from logger import TrainingLogger
 from Model.deep_learning import DatasetLoad, CNN_Model, Train_one_epoch, Evaluate, \
     Get_mean_and_std, Recod_and_Save_Train_Detial, FNN_Model
 from evaluation_metrics import Metrix_computing
+from utils.losses import LabelSmoothingLoss, mixup_data, mixup_criterion
+import math
 
 
 import warnings
@@ -25,19 +27,47 @@ def Load_data(dir):
     return data_dir
 
 
+def get_cosine_schedule_with_warmup(optimizer, num_warmup_steps, num_training_steps, num_cycles=0.5):
+    def lr_lambda(current_step):
+        if current_step < num_warmup_steps:
+            return float(current_step) / float(max(1, num_warmup_steps))
+        progress = float(current_step - num_warmup_steps) / float(max(1, num_training_steps - num_warmup_steps))
+        return max(0.0, 0.5 * (1.0 + math.cos(math.pi * progress)))
+
+    return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
+
+
 def Main(feature_name, model_name):
     logger = TrainingLogger("logs")
+    logger.log("=== Starting Training Pipeline ===")
+    logger.log(f"Feature Type: {feature_name} (Spectrogram/Mel-Spectrogram/Statistical Features)")
+    logger.log(f"Model Architecture: {model_name} (Convolutional Neural Network/Feed-Forward Neural Network)")
+    
+    # Device setup
     device = torch.device(Config.device if torch.cuda.is_available() else "cpu")
+    logger.log(f"Using device: {device} (CUDA Graphics Processing Unit/Central Processing Unit)")
+    
+    # Create directories
     if not os.path.exists(os.path.join(Config.savedir_train_and_test, "Record")):
         os.makedirs(os.path.join(Config.savedir_train_and_test, "Record"))
+        logger.log("Created Record directory for saving model checkpoints")
 
-    senList, speList, aeList, hsList, accList, confusion_matrix_List  = [], [], [], [], [], []
-    
-    # Find existing folds
+    # Initialize metric lists
+    logger.log("Initializing metric tracking lists:")
+    logger.log("- SEN: Sensitivity (True Positive Rate)")
+    logger.log("- SPE: Specificity (True Negative Rate)")
+    logger.log("- ACC: Accuracy (Correct Predictions/Total Predictions)")
+    logger.log("- AE: Average Error")
+    logger.log("- HS: Harmonic Score")
+    senList, speList, aeList, hsList, accList, confusion_matrix_List = [], [], [], [], [], []
+
+    # Process each fold
     existing_folds = [f for f in os.listdir(Config.savedir_train_and_test) if f.startswith("Fold_")]
-    existing_folds.sort(key=lambda x: int(x.split("_")[1]))  # Sort folds numerically
+    existing_folds.sort(key=lambda x: int(x.split("_")[1]))
+    logger.log(f"Found {len(existing_folds)} cross-validation folds")
 
     for fold in existing_folds:
+        logger.log(f"\n=== Processing {fold} ===")
         count = int(fold.split("_")[1])
         train_list_path = os.path.join(Config.savedir_train_and_test, fold, "train_list.txt")
         test_list_path = os.path.join(Config.savedir_train_and_test, fold, "test_list.txt")
@@ -82,18 +112,41 @@ def Main(feature_name, model_name):
         elif model_name == "FNN":
             model = FNN_Model(Config.Num_classes).to(device)
 
+        # Load existing weights if available
+        weight_path = os.path.join(Config.savedir_train_and_test, "Record", f"Fold_{count}_model_weights_Epoch_Final.pth")
+        start_epoch = 0
+        if os.path.exists(weight_path):
+            model.load_state_dict(torch.load(weight_path))
+            print(f"Loaded weights from {weight_path}")
+            # Set start_epoch to the last saved epoch
+            start_epoch = Config.EPOCH - (Config.EPOCH % 30)  # Adjust this based on your saving logic
+
         # optimizer
-        optimizer = torch.optim.Adam(model.parameters(), lr=Config.lr, weight_decay=Config.weight_decay)
+        optimizer = torch.optim.AdamW(model.parameters(), 
+                                    lr=Config.INITIAL_LR, 
+                                    weight_decay=Config.WEIGHT_DECAY)
+
+        num_training_steps = len(train_dataloader) * Config.NUM_EPOCHS
+        num_warmup_steps = len(train_dataloader) * Config.WARMUP_EPOCHS
+        
+        scheduler = get_cosine_schedule_with_warmup(optimizer, 
+                                                  num_warmup_steps, 
+                                                  num_training_steps)
 
         # train & test
         train_recorder, test_recorder = [], []
-        for epoch in range(Config.EPOCH):
-            train_info = Train_one_epoch(model, optimizer, train_dataloader, device, epoch,logger)
+        for epoch in range(start_epoch, Config.EPOCH):
+            train_info = Train_one_epoch(model, optimizer, train_dataloader, device, epoch, logger, scheduler)
             train_recorder.append(train_info)
 
-            test_info = Evaluate(model, test_data, device,logger)
+            test_info = Evaluate(model, test_data, device)
             test_recorder.append(test_info)
-# Log detailed metrics
+
+            # Log learning rate
+            current_lr = optimizer.param_groups[0]['lr']
+            logger.log(f"Current Learning Rate: {current_lr}")
+
+            # Log detailed metrics
             logger.log(f"\nEpoch {epoch} Summary:")
             logger.log(f"Training - Loss: {train_info[0]:.4f}, Acc: {train_info[1]:.4f}")
             logger.log(f"Validation - Loss: {test_info[0]:.4f}, Acc: {test_info[1]:.4f}")
@@ -106,7 +159,7 @@ def Main(feature_name, model_name):
                   f"SEN: {test_info[2]:.6f}, SPE: {test_info[3]:.6f}, AE: {test_info[4]:.6f}, HS: {test_info[5]:.6f}\n")
 
             # save the weights
-            if (epoch+1) % 30 == 0 and epoch > 0:
+            if (epoch + 1) % 30 == 0 and epoch > 0:
                 print(test_info[-2])
                 print(test_info[-1])
                 torch.save(model.state_dict(), os.path.join(Config.savedir_train_and_test, "Record", f"Fold_{count}_model_weights_Epoch_{epoch}.pth"))
@@ -130,6 +183,14 @@ def Main(feature_name, model_name):
         aeList.append(test_info[4])
         hsList.append(test_info[5])
         confusion_matrix_List.append(test_info[6])
+
+    # Final Results
+    logger.log("\n=== Final Cross-Validation Results ===")
+    logger.log(f"Mean Accuracy: {np.mean(accList):.4f} (Average across all folds)")
+    logger.log(f"Mean Sensitivity: {np.mean(senList):.4f} (Average True Positive Rate)")
+    logger.log(f"Mean Specificity: {np.mean(speList):.4f} (Average True Negative Rate)")
+    logger.log(f"Mean Average Error: {np.mean(aeList):.4f}")
+    logger.log(f"Mean Harmonic Score: {np.mean(hsList):.4f}")
 
     for i, matrix in enumerate(confusion_matrix_List):
         print(i)

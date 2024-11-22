@@ -23,5 +23,22 @@ class TrainingLogger:
         )
         self.logger = logging.getLogger(__name__)
         
-    def log(self, message):
-        self.logger.info(message)
+    def log(self, message, level='info'):
+        """
+        Levels:
+        - info: Standard information
+        - debug: Detailed debugging information
+        - warning: Warning messages
+        - error: Error messages
+        - metric: Training/validation metrics
+        """
+        if level == 'debug':
+            self.logger.debug(message)
+        elif level == 'warning':
+            self.logger.warning(message)
+        elif level == 'error':
+            self.logger.error(message)
+        elif level == 'metric':
+            self.logger.info(f"[METRIC] {message}")
+        else:
+            self.logger.info(message)

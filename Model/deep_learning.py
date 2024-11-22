@@ -15,6 +15,12 @@ from sklearn.preprocessing import normalize
 from sklearn.metrics import classification_report
 from torch.optim.optimizer import Optimizer
 from evaluation_metrics import Metrix_computing
+from utils.augmentations import AudioAugmentation
+import random
+from logger import TrainingLogger
+import psutil
+
+logger = TrainingLogger("logs")
 
 
 class FNN_Model(nn.Module):
@@ -35,64 +41,114 @@ class FNN_Model(nn.Module):
         )
 
     def forward(self, x):
-        embedding = self.feature(x)
-        x = self.output(embedding)
-
-        outputDir = {"embedding": embedding, "output": x}
-
-        return outputDir
+        logger.log(f"Forward pass - Input shape: {x.shape}", level='debug')
+    
+        x = self.conv1(x)
+        logger.log(f"After conv1: {x.shape}", level='debug')
+    
+        x = self.conv2(x)
+        logger.log(f"After conv2: {x.shape}", level='debug')
+    
+        x = self.conv3(x)
+        logger.log(f"After conv3: {x.shape}", level='debug')
+    
+        x = self.adaptive_pool(x)
+        logger.log(f"After adaptive_pool: {x.shape}", level='debug')
+    
+        x = torch.flatten(x, 1)
+        logger.log(f"After flatten: {x.shape}", level='debug')
+    
+        embedding = self.classifier[:-1](x)
+        output = self.classifier[-1](embedding)
+    
+        return {"embedding": embedding, "output": output}
 
 
 
 class CNN_Model(nn.Module):
-    def __init__(self, Num_classes):
+    def __init__(self, num_classes):
         super(CNN_Model, self).__init__()
-
-        self.feature0 = nn.Sequential(
-            nn.Conv2d(1, 32, 3),
-            nn.BatchNorm2d(32),
+        
+        # First convolutional block
+        self.conv1 = nn.Sequential(
+            nn.Conv2d(1, 64, kernel_size=3, padding=1),
+            nn.BatchNorm2d(64),
             nn.ReLU(inplace=True),
-            nn.MaxPool2d(2),
-
-            nn.Conv2d(32, 64, 3),
+            nn.Conv2d(64, 64, kernel_size=3, padding=1),
             nn.BatchNorm2d(64),
             nn.ReLU(inplace=True),
             nn.MaxPool2d(2)
         )
-        self.adaptpool2 = nn.AdaptiveAvgPool1d(128)
-        self.feature1 = nn.Sequential(
-            nn.Dropout(0.2),
-
-            nn.Linear(128, 32),
+        
+        # Second convolutional block
+        self.conv2 = nn.Sequential(
+            nn.Conv2d(64, 128, kernel_size=3, padding=1),
+            nn.BatchNorm2d(128),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(128, 128, kernel_size=3, padding=1),
+            nn.BatchNorm2d(128),
+            nn.ReLU(inplace=True),
+            nn.MaxPool2d(2)
+        )
+        
+        # Third convolutional block
+        self.conv3 = nn.Sequential(
+            nn.Conv2d(128, 256, kernel_size=3, padding=1),
+            nn.BatchNorm2d(256),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(256, 256, kernel_size=3, padding=1),
+            nn.BatchNorm2d(256),
+            nn.ReLU(inplace=True),
+            nn.MaxPool2d(2)
+        )
+        
+        self.adaptive_pool = nn.AdaptiveAvgPool2d((4, 4))
+        
+        self.classifier = nn.Sequential(
+            nn.Linear(256 * 4 * 4, 512),
             nn.ReLU(inplace=True),
             nn.Dropout(0.5),
+            nn.Linear(512, 128),
+            nn.ReLU(inplace=True),
+            nn.Dropout(0.5),
+            nn.Linear(128, num_classes)
         )
 
-        self.output = nn.Linear(32, Num_classes)
-
-        # Ensure all parameters are float32
-        self.to(torch.float32)
-
     def forward(self, x):
-        x = self.feature0(x)
-        x = torch.flatten(x, start_dim=1)
-        x = self.adaptpool2(x)
-        embedding = self.feature1(x)
-        x = self.output(embedding)
+        # Add shape logging
+        #print(f"Input shape: {x.shape}")
+        
+        x = self.conv1(x)
+        #print(f"After conv1: {x.shape}")
+        
+        x = self.conv2(x)
+        #print(f"After conv2: {x.shape}")
+        
+        x = self.conv3(x)
+        #print(f"After conv3: {x.shape}")
+        
+        x = self.adaptive_pool(x)
+        #print(f"After adaptive_pool: {x.shape}")
+        
+        x = torch.flatten(x, 1)
+        #print(f"After flatten: {x.shape}")
+        
+        embedding = self.classifier[:-1](x)
+        output = self.classifier[-1](embedding)
+        
+        return {"embedding": embedding, "output": output}
 
-        outputDir = {"embedding": embedding, "output": x}
-
-        return outputDir
 
 
-
-def Train_one_epoch(model, optimizer, train_dataloader, device, epoch, logger):
-    # Add logger parameter
+def Train_one_epoch(model, optimizer, train_dataloader, device, epoch, logger, scheduler=None):
+    """
+    Train model for one epoch
+    """
+    logger.log("Setting model to train mode")
     model.train()
     optimizer.zero_grad()
 
     task_ce_criterion = nn.CrossEntropyLoss().to(device)
-
     acclosses = AverageMeter()
     train_loss_sum, train_acc_sum, n = 0.0, 0.0, 0
     all_prediction, all_labels = [], []
@@ -103,28 +159,60 @@ def Train_one_epoch(model, optimizer, train_dataloader, device, epoch, logger):
         # Log batch progress periodically
         if batch % 10 == 0:
             logger.log(f"Epoch {epoch} - Processing batch {batch}/{len(train_dataloader)}")
+            logger.log(f"Input shape: {data.shape}")
 
-        data, labels = data.float().to(device), labels.long().to(device)
+        try:
+            # Move data to device
+            logger.log(f"Moving batch {batch} to device", level='debug')
+            data, labels = data.float().to(device), labels.long().to(device)
 
-        outputs = model(data)["output"]
+            # Forward pass
+            logger.log(f"Forward pass for batch {batch}", level='debug')
+            outputs = model(data)["output"]
+            
+            # Calculate loss
+            logger.log(f"Computing loss for batch {batch}", level='debug')
+            loss = task_ce_criterion(outputs, labels)
+            acclosses.update(loss.item(), data.shape[0])
 
-        loss = task_ce_criterion(outputs, labels)
-        acclosses.update(loss.item(), data.shape[0])
+            # Backward pass
+            logger.log(f"Backward pass for batch {batch}", level='debug')
+            optimizer.zero_grad()
+            loss.backward()
+            
+            # Optimizer step
+            logger.log(f"Optimizer step for batch {batch}", level='debug')
+            optimizer.step()
 
-        optimizer.zero_grad()
-        loss.backward()
-        optimizer.step()
+            # Scheduler step if it exists
+            if scheduler is not None:
+                scheduler.step()
+                logger.log(f"Current learning rate: {optimizer.param_groups[0]['lr']}", level='debug')
 
+            # Calculate accuracy
+            logger.log(f"Computing accuracy for batch {batch}", level='debug')
+            train_acc_sum += (outputs.argmax(dim=1) == labels).sum().cpu().item()
+            n += len(labels)
 
-        train_acc_sum += (outputs.argmax(dim=1) == labels).sum().cpu().item()
-        n += len(labels)
+            # Store predictions
+            _, prediction = torch.max(outputs.data, dim=1)
+            all_prediction.extend(prediction.to('cpu'))
+            all_labels.extend(labels.to('cpu'))
 
-        _, prediction = torch.max(outputs.data, dim=1)
-        all_prediction.extend(prediction.to('cpu'))
-        all_labels.extend(labels.to('cpu'))
+            if batch % 10 == 0:
+                logger.log(f"Completed batch {batch}/{len(train_dataloader)} - "
+                         f"Loss: {loss.item():.4f}, "
+                         f"Acc: {train_acc_sum/n:.4f}")
 
+        except Exception as e:
+            logger.log(f"Error in batch {batch}: {str(e)}", level='error')
+            logger.log(f"Data shape: {data.shape}", level='error')
+            logger.log(f"Labels shape: {labels.shape}", level='error')
+            raise e
+
+    # Compute final metrics
+    logger.log("Computing final metrics for epoch")
     train_loss_sum = acclosses.avg
-
     confusion_matrix, sen, spe, ae, hs, acc, report = Metrix_computing(all_labels, all_prediction)
 
     # Log epoch results
@@ -132,42 +220,34 @@ def Train_one_epoch(model, optimizer, train_dataloader, device, epoch, logger):
 
     return acclosses.avg, acc, sen, spe, ae, hs, confusion_matrix, report
 @torch.no_grad()
-def Evaluate(model, dataloader, device, logger):
-    # 训练模式
-    model.eval()
-    logger.log("Starting evaluation")
-
-    # Loss Function
-    task_ce_criterion = nn.CrossEntropyLoss().to(device)
-
-    # Metrix
-    acclosses = AverageMeter()  # 损失累积
-    test_loss_sum, test_acc_sum, n = 0, 0, 0
-    all_prediction, all_labels = [], []
-
-
-    for batch, (data, labels) in enumerate(dataloader):
-        data, labels = data.float().to(device), labels.long().to(device)
-
-        outputs = model(data)["output"]
-
-        # 计算损失函数
-        loss = task_ce_criterion(outputs, labels)
-        acclosses.update(loss.item(), data.shape[0])
-
-        _, prediction = torch.max(outputs.data, dim=1)
-        all_prediction.extend(prediction.to('cpu'))
-        all_labels.extend(labels.to('cpu'))
-
-        test_acc_sum += (outputs.argmax(dim=1) == labels).sum().cpu().item()
-        n += len(labels)
-
-    test_loss_sum = acclosses.avg
+def Evaluate(model, data_loader, device):
+    logger.log("\n=== Starting Evaluation ===")
+    logger.log("Setting model to evaluation mode (disabling dropout/batch normalization)")
     
-    logger.log(f"Evaluation completed - Loss: {test_loss_sum:.4f}, Acc: {test_acc_sum/n:.4f}")
-    confusion_matrix, sen, spe, ae, hs, acc, report = Metrix_computing(all_labels, all_prediction)
+    all_labels, all_prediction = [], []
+    with torch.no_grad():
+        logger.log("Disabled gradient computation for evaluation")
+        
+        for batch_idx, batch in enumerate(data_loader):
+            if batch_idx % 10 == 0:
+                logger.log(f"Processing batch {batch_idx}/{len(data_loader)}")
+                
+            inputs, labels = batch
+            inputs, labels = inputs.float().to(device), labels.to(device)
+            outputs = model(inputs)
+            outputs = outputs['output']
+            _, predicted = torch.max(outputs, 1)
+            
+            all_labels.extend(labels.cpu().numpy())
+            all_prediction.extend(predicted.cpu().numpy())
 
-    return (test_loss_sum, test_acc_sum / n,  sen, spe, ae, hs, confusion_matrix, report)
+    logger.log("Computing evaluation metrics:")
+    confusion_matrix, sen, spe, ae, hs, acc, report = Metrix_computing(all_labels, all_prediction)
+    
+    logger.log(f"Confusion Matrix:\n{confusion_matrix}")
+    logger.log(f"Classification Report:\n{report}")
+    
+    return 0.0, acc, sen, spe, ae, hs, confusion_matrix, report
 
 
 
@@ -247,25 +327,37 @@ def Recod_and_Save_Train_Detial(count, dir, train_recorder, test_recorder, show_
 
 
 class DatasetLoad(Dataset):
-    def __init__(self, data_dir, feature_name, input_transform=None):
+    def __init__(self, data_dir, feature_name, input_transform=None, is_training=False):
         self.data = data_dir
         self.feature_name = feature_name
         self.input_transform = input_transform
+        self.is_training = is_training
+        self.augmenter = AudioAugmentation() if is_training else None
 
     def __getitem__(self, index):
         samples = self.Data_Acq(self.data[index])
         data = samples[self.feature_name]
         label = samples["label"]
 
-        # 转化
-        if self.input_transform is not None:
-            if type(self.input_transform) is list:
-                data = (data - self.input_transform[0]) / self.input_transform[1]
-            else:
-                data = self.input_transform(data)
+        # Ensure data is in the correct format for CNN
+        if len(data.shape) == 2:  # If 2D spectrogram
+            data = data[None, :, :]  # Add channel dimension
+        elif len(data.shape) == 3 and data.shape[0] > 1:  # If multi-channel
+            data = data[0:1, :, :]  # Take first channel only
 
-        # Convert data to float32
-        data = torch.tensor(data, dtype=torch.float32)
+        # Apply augmentation during training
+        if self.is_training and random.random() < 0.5:
+            if random.random() < 0.5:
+                data = self.augmenter.time_shift(data)
+            if random.random() < 0.5:
+                data = self.augmenter.add_noise(data)
+            if random.random() < 0.5:
+                data = self.augmenter.change_pitch(data)
+
+        # Convert to tensor if not already
+        if not isinstance(data, torch.Tensor):
+            data = torch.tensor(data, dtype=torch.float32)
+
         return data, label
 
     def Data_Acq(self, dir):
@@ -322,6 +414,16 @@ def Load_data(dir):
             line = file.readline()
 
     return data_dir
+
+
+
+def print_memory_stats(logger):
+    if torch.cuda.is_available():
+        logger.log(f"GPU Memory allocated: {torch.cuda.memory_allocated()/1024**2:.2f} MB")
+        logger.log(f"GPU Memory cached: {torch.cuda.memory_reserved()/1024**2:.2f} MB")
+    
+    process = psutil.Process()
+    logger.log(f"CPU Memory used: {process.memory_info().rss/1024**2:.2f} MB")
 
 
 
